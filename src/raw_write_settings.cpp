@@ -1,6 +1,7 @@
 #include "raw_write_settings.hpp"
 
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 
 #include <thread>
 
@@ -8,6 +9,7 @@ namespace duckdb {
 
 RawWriteSettings RawWriteSettings::Get(ClientContext &context) {
 	RawWriteSettings settings;
+	settings.engine_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	Value value;
 	if (context.TryGetCurrentSetting("rawduck_pool_min_rows", value) && !value.IsNull()) {
 		auto min_rows = value.GetValue<int64_t>();
@@ -50,7 +52,11 @@ idx_t RawWriteSettings::PoolThreadCount(idx_t batch_rows) const {
 		return MinValue<idx_t>(pool_threads, MAX_POOL_THREADS);
 	}
 	if (batch_rows >= pool_min_rows) {
-		return MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 2, MAX_POOL_THREADS));
+		idx_t auto_threads = MinValue<idx_t>(std::thread::hardware_concurrency() / 2, AUTO_POOL_THREAD_CAP);
+		if (engine_threads > 0) {
+			auto_threads = MinValue<idx_t>(auto_threads, engine_threads);
+		}
+		return MaxValue<idx_t>(1, auto_threads);
 	}
 	return 1;
 }
@@ -59,7 +65,11 @@ idx_t RawWriteSettings::PipelineThreadCount() const {
 	if (pipeline_threads > 0) {
 		return MinValue<idx_t>(pipeline_threads, MAX_PIPELINE_THREADS);
 	}
-	return MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() * 2 / 3, MAX_PIPELINE_THREADS));
+	idx_t auto_threads = MinValue<idx_t>(std::thread::hardware_concurrency() * 2 / 3, MAX_PIPELINE_THREADS);
+	if (engine_threads > 0) {
+		auto_threads = MinValue<idx_t>(auto_threads, engine_threads);
+	}
+	return MaxValue<idx_t>(1, auto_threads);
 }
 
 idx_t RawWriteSettings::PipelineConsumerCount() const {

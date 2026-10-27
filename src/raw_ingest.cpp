@@ -437,15 +437,20 @@ public:
 		}
 		idx_t total = 0;
 		auto merge_threshold = storage.GetRowGroupSize() / 8;
-		const bool flush_now = overlap_flush;
-		// phase 1, parallel: finalize each worker. Mid-append overlap_flush
-		// already wrote complete row groups; finish those to disk here. The
-		// default (in-memory until drain) skips that write: LocalMerge keeps
-		// uncompressed collections in local storage and CHECKPOINT packs them
-		// once — same GLOBAL partial-block path as DuckDB INSERT, without a
-		// second allocation that leaves free-list holes.
+		// phase 1, parallel: finalize each worker. A worker holding at least
+		// one full row group (a bulk import) compresses and writes it here, on
+		// its own thread, so compression runs in parallel; mid-append
+		// overlap_flush may already have written some of it. Smaller workers
+		// stay in memory: LocalMerge keeps their uncompressed collections in
+		// local storage and CHECKPOINT packs them once (GLOBAL partial blocks,
+		// same as DuckDB INSERT), which keeps small/medium tables compact.
+		// Deferring large workers too moves all compression to a single thread
+		// at commit (~2x slower bulk INSERT for the same file size).
+		auto bulk_threshold = storage.GetRowGroupSize();
+		vector<uint8_t> flushed(workers.size(), 0); // not vector<bool>: written from worker threads
 		vector<std::thread> flushers;
-		for (auto &worker : workers) {
+		for (idx_t worker_idx = 0; worker_idx < workers.size(); worker_idx++) {
+			auto &worker = workers[worker_idx];
 			// pad to the full published schema so layouts match the table
 			vector<pair<string, LogicalType>> missing;
 			for (auto &slot : slots) {
@@ -461,12 +466,15 @@ public:
 			// created against it (no evolution) or rebuilt by ExtendWorker, and
 			// it holds the partial blocks from incremental flushes, so reuse it
 			// rather than dropping that state on the floor.
-			flushers.emplace_back([&worker, merge_threshold, flush_now] {
+			const bool overlap = overlap_flush;
+			flushers.emplace_back([&worker, &flushed, worker_idx, merge_threshold, bulk_threshold, overlap] {
 				auto &collection = *worker.collection->collection;
 				collection.FinalizeAppend(TransactionData(0, 0), *worker.append_state);
-				if (flush_now && collection.GetTotalRows() >= merge_threshold) {
+				auto rows = collection.GetTotalRows();
+				if (rows >= merge_threshold && (overlap || rows >= bulk_threshold)) {
 					worker.writer->WriteUnflushedRowGroups(*worker.collection);
 					worker.writer->FinalFlush();
+					flushed[worker_idx] = 1;
 				}
 			});
 		}
@@ -475,7 +483,8 @@ public:
 		}
 		// phase 2, serial: cheap pointer-level merges into local storage
 		vector<unique_ptr<BoundConstraint>> no_constraints;
-		for (auto &worker : workers) {
+		for (idx_t worker_idx = 0; worker_idx < workers.size(); worker_idx++) {
+			auto &worker = workers[worker_idx];
 			auto &collection = *worker.collection->collection;
 			auto count = collection.GetTotalRows();
 			if (count == 0) {
@@ -493,7 +502,7 @@ public:
 				storage.FinalizeLocalAppend(append_state);
 			} else {
 				storage.LocalMerge(context, *worker.collection);
-				if (flush_now) {
+				if (flushed[worker_idx]) {
 					storage.GetOptimisticWriter(context).Merge(*worker.writer);
 				}
 			}
